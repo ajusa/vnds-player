@@ -1,2 +1,3 @@
 --path:"../src"
 --cc:tcc
+--multiMethods:on

@@ -1,99 +1,90 @@
-import strutils, parseutils, fusion/matching
+import parser, tables, strutils, parseutils, fusion/matching, with, lenientops
 {.experimental: "caseStmtMacros".}
 type 
-  InstructionKind* = enum
-    bgload, setimg, sound, music, text, choice, setvar,gsetvar,
-    conditional = "if", endConditional = "fi", jump, delay, random, label, goto
-  Modifier* = enum equals = "=", plus = "+", minus = "-"
-  TypeKind* = enum tkString, tkInt, tkFloat
-  VNType* = object
+  TypeKind = enum tkString, tkInt, tkFloat
+  VNType = object
     case kind: TypeKind
-    of tkString: strVal*: string
+    of tkString: stringVal*: string
     of tkInt: intVal*: int
     of tkFloat: floatVal*: float
-  Comparison* = enum eq = "==", neq = "!=", lte = "<=", gte = ">=", lt = "<", gt = ">"
-  Instruction* = object
-    case kind: InstructionKind
-    of bgload:
-      bgloadFile*: string
-      fadeFrames*: int
-    of setimg:
-      setimgFile*: string
-      x*: int
-      y*: int
-    of sound:
-      soundFile*: string
-      times*: int
-    of music: musicFile*: string
-    of text: text*: string
-    of choice: choices*: seq[string]
-    of setvar, gsetvar:
-      modifier*: Modifier
-      setVariable*: string
-      setValue*: string
-    of conditional:
-      comparison*: Comparison
-      variable*: string
-      value*: string
-    of endConditional: discard
-    of jump:
-      jumpFile*: string
-      label*: string
-    of delay: delayFrames*: int
-    of random:
-      randomVariable*: string
-      min*: int
-      max*: int
-    of label, goto: name*: string
-proc stripQuotes(x: string): string =
-  var cp = x
-  cp.removeSuffix("\"")
-  cp.removePrefix("\"")
-  return cp
+  Interpreter* = object
+    instructions: seq[Instruction]
+    n: int
+    globalTable: TableRef[string, VNType]
+    localTable: TableRef[string, VNType]
+    labels: TableRef[string, int]
 
-proc parse*(buffer: string): seq[Instruction] =
-  for rawLine in buffer.splitLines:
-    var line = rawLine.strip
-    if line.len > 0 and not line.startsWith("#"):
-      var instructionName: string
-      discard line.parseUntil(instructionName, Whitespace)
-      var args = line.split(" ")[1..^1]
-      var instruction = Instruction(kind: parseEnum[InstructionKind](instructionName))
-      case (instruction, args):
-        of (bgload(), [@file, opt @frames or "16"]):
-          instruction.bgloadFile = file
-          instruction.fadeFrames = frames.parseInt
-        of (setimg(), [@file, @x, @y]):
-          instruction.setimgFile = file
-          instruction.x = x.parseInt
-          instruction.y = y.parseInt
-        of (sound(), [@file, opt @times or "1"]):
-          instruction.soundFile = file
-          instruction.times = times.parseInt
-        of (music(), [@file]):
-          instruction.musicFile = file
-        of (text(), @words):
-          instruction.text = words.join(" ")
-        of (choice(), @words):
-          instruction.choices = words.join(" ").split("|")
-        of ((kind: in {setvar, gsetvar}), [@variable, @modifier, all @words]):
-          instruction.setVariable = variable
-          instruction.modifier = parseEnum[Modifier](modifier)
-          instruction.setValue = words.join(" ").stripQuotes
-        of (conditional(), [@variable, @comparison, all @words]):
-          instruction.variable = variable
-          instruction.comparison = parseEnum[Comparison](comparison)
-          instruction.value = words.join(" ").stripQuotes
-        of (jump(), [@file, opt @label or ""]):
-          instruction.jumpFile = file
-          instruction.label = label
-        of (delay(), [@frames]):
-          instruction.delayFrames = frames.parseInt
-        of (random(), [@variable, @min, @max]):
-          instruction.randomVariable = variable
-          instruction.min = min.parseInt
-          instruction.max = max.parseInt
-        of ((kind: {label, goto}), [@name]):
-          instruction.name = name
-        else: continue # unsupported instruction format
-      result.add instruction
+proc eval*(state: Interpreter, ins: Instruction): Instruction =
+  ## Evaluates the instruction and returns the "filled in" version
+  echo ins
+
+proc initInterpreter*(instructions: string): Interpreter =
+  result = Interpreter(
+    instructions: instructions.parse,
+    n: 0,
+    globalTable: newTable[string, VNType](),
+    localTable: newTable[string, VNType](),
+    labels: newTable[string, int]()
+  )
+  # Mark down where each label is
+  for i, ins in result.instructions:
+    if ins.kind == label:
+      result.labels[ins.name] = i
+proc initVNType*(
+    x: string,
+    local = newTable[string, VNType](),
+    global = newTable[string, VNType]()
+  ): VNType =
+  ## Figures out the type of a literal, uses local/global to lookup variable value as well
+  if x[0] == '"':
+    return VNType(kind: tkString, stringVal: x)
+  if "." in x:
+    return VNType(kind: tkFloat, floatVal: x.parseFloat)
+  var intVal: int
+  if x.parseInt(intVal) != 0:
+    return VNType(kind: tkInt, intVal: intVal)
+  result =
+    if x in local: local[x]
+    elif x in global: global[x]
+    else: VNType(kind: tkString, stringVal: "")
+template numericOperator(op: untyped, stringDefined = false): untyped =
+  proc `-` (a, b: VNType): VNType =
+    case (a.kind, b.kind):
+      of (tkInt, tkInt):
+        return VNType(kind: tkInt, intVal: op(a.intVal, b.intVal))
+      of (tkFloat, tkFloat):
+        return VNType(kind: tkFloat, floatVal: op(a.floatVal, b.floatVal))
+      of (tkInt, tkFloat):
+        return VNType(kind: tkFloat, floatVal: op(a.intVal, b.floatVal))
+      of (tkFloat, tkInt):
+        return VNType(kind: tkFloat, floatVal: op(a.floatVal, b.intVal))
+      of (tkString, tkFloat):
+        return VNType(kind: tkString, stringVal: a.stringVal & $b.floatVal)
+      of (tkString, tkInt):
+        return VNType(kind: tkString, stringVal: a.stringVal & $b.intVal)
+      of (tkInt, tkString):
+        return VNType(kind: tkString, stringVal: $a.intVal & b.stringVal)
+      of (tkFloat, tkString):
+        return VNType(kind: tkString, stringVal: $a.floatVal & b.stringVal)
+numericOperator(`-`)
+proc `-=` (a: var VNType, b: VNType) = a = a - b
+proc `+` (a, b: VNType): VNType = a
+proc `+=` (a: var VNType, b: VNType) = a = a + b
+
+proc run*(state: var Interpreter) =
+  with state:
+    while n < instructions.len:
+      var ins = instructions[n]
+      case ins:
+        of (kind: in {setvar, gsetvar}):
+          var table = if ins.kind == setvar: localTable else: globalTable
+          var val = ins.setValue.initVNType(localTable, globalTable)
+          case ins.modifier:
+            of equals: table[ins.setVariable] = val
+            of plus: table[ins.setVariable] += val
+            of minus: table[ins.setVariable] -= val
+          echo val
+        of text():
+          echo ins
+        else: discard
+      inc n

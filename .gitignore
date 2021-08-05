@@ -2,3 +2,7 @@
 *
 !*/
 !*.*
+nimcache
+*.3dsx
+*.bin
+*.elf

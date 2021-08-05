@@ -1,3 +1,3 @@
-import interpreter, print
+import parser, print
 
 echo readFile("test.scr").parse
